@@ -24,6 +24,7 @@
             padding: 24px;
             text-align: center;
             overflow: hidden;
+            user-select: none;
         }
         h1 {
             font-size: 28px;
@@ -38,7 +39,7 @@
             padding: 8px 18px;
             border-radius: 20px;
             background: rgba(255, 255, 255, 0.05);
-            transition: all 0.3s ease;
+            transition: all 0.2s ease;
         }
         .status.active {
             color: #4ade80;
@@ -60,7 +61,7 @@
             font-size: 18px;
             font-weight: 800;
             cursor: pointer;
-            transition: transform 0.15s ease;
+            transition: transform 0.1s ease;
         }
         .btn:active {
             transform: scale(0.96);
@@ -83,8 +84,8 @@
     <div id="statusBadge" class="status">Вибрация выключена</div>
 
     <div class="btn-group">
-        <button class="btn btn-on" onclick="startVibration()">Включить вибрацию</button>
-        <button class="btn btn-off" onclick="stopVibration()">Выключить вибрацию</button>
+        <button id="btnOn" class="btn btn-on">Включить вибрацию</button>
+        <button id="btnOff" class="btn btn-off">Выключить вибрацию</button>
     </div>
 
     <script>
@@ -93,34 +94,31 @@
         tg.expand();
 
         let isVibrating = false;
-        let androidLoop = null;
-        let iosLoop = null;
+        let vibroTimer = null;
         let wakeLock = null;
         let audioCtx = null;
 
-        // 1. Запускаем беззвучный аудиопоток, чтобы телефон не усыплял вкладку
+        // Определяем, iOS ли это (на iPhone navigator.vibrate отсутствует или не работает)
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+
         function startKeepAliveAudio() {
             try {
                 const AudioContext = window.AudioContext || window.webkitAudioContext;
-                if (!audioCtx) {
-                    audioCtx = new AudioContext();
-                }
-                if (audioCtx.state === 'suspended') {
-                    audioCtx.resume();
-                }
+                if (!audioCtx) audioCtx = new AudioContext();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+                
                 const oscillator = audioCtx.createOscillator();
                 const gainNode = audioCtx.createGain();
-                gainNode.gain.value = 0.0001; // Почти нулевая громкость
+                gainNode.gain.value = 0.0001;
                 oscillator.connect(gainNode);
                 gainNode.connect(audioCtx.destination);
                 oscillator.start();
             } catch (e) {}
         }
 
-        // 2. Удерживаем экран активным
         async function requestWakeLock() {
             try {
-                if ('wakeLock' in navigator) {
+                if ('wakeLock' in navigator && !wakeLock) {
                     wakeLock = await navigator.wakeLock.request('screen');
                 }
             } catch (e) {}
@@ -128,12 +126,25 @@
 
         function releaseWakeLock() {
             if (wakeLock) {
-                wakeLock.release();
+                wakeLock.release().catch(() => {});
                 wakeLock = null;
             }
         }
 
-        // 3. Запуск бесконечного цикла
+        function runCycle() {
+            if (!isVibrating) return;
+
+            if (!isIOS && "vibrate" in navigator) {
+                // На Android запускаем чистый 1-секундный гудок БЕЗ HapticFeedback
+                navigator.vibrate(1000);
+                vibroTimer = setTimeout(runCycle, 980);
+            } else if (tg.HapticFeedback) {
+                // На iPhone используем только нативный тактильный отклик
+                tg.HapticFeedback.impactOccurred('heavy');
+                vibroTimer = setTimeout(runCycle, 110);
+            }
+        }
+
         function startVibration() {
             if (isVibrating) return;
             isVibrating = true;
@@ -142,42 +153,25 @@
             requestWakeLock();
 
             const status = document.getElementById('statusBadge');
-            status.textContent = '📳 Вибрация работает бесконечно...';
+            status.textContent = '📳 Вибрация работает...';
             status.classList.add('active');
 
-            // Длинный непрерывный паттерн для Android (5 секунд гудка + 5 мс пауза, и так по кругу)
-            const fireAndroid = () => {
-                if (!isVibrating) return;
-                if ("vibrate" in navigator) {
-                    navigator.vibrate([5000, 5, 5000, 5]);
-                }
-            };
-            fireAndroid();
-            androidLoop = setInterval(fireAndroid, 9900);
-
-            // Быстрый пулеметный тактильный отклик для iPhone (каждые 120 мс)
-            const fireIOS = () => {
-                if (!isVibrating) return;
-                if (tg.HapticFeedback) {
-                    tg.HapticFeedback.impactOccurred('heavy');
-                }
-            };
-            fireIOS();
-            iosLoop = setInterval(fireIOS, 120);
+            runCycle();
         }
 
-        // 4. Полная остановка по кнопке
         function stopVibration() {
             isVibrating = false;
-            clearInterval(androidLoop);
-            clearInterval(iosLoop);
+            if (vibroTimer) {
+                clearTimeout(vibroTimer);
+                vibroTimer = null;
+            }
             releaseWakeLock();
 
-            if ("vibrate" in navigator) {
+            if (!isIOS && "vibrate" in navigator) {
                 navigator.vibrate(0);
             }
             if (audioCtx && audioCtx.state === 'running') {
-                audioCtx.suspend();
+                audioCtx.suspend().catch(() => {});
             }
 
             const status = document.getElementById('statusBadge');
@@ -185,15 +179,9 @@
             status.classList.remove('active');
         }
 
-        // Если экран случайно переключился и вернулся — восстанавливаем работу
-        document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible' && isVibrating) {
-                requestWakeLock();
-                if ("vibrate" in navigator) {
-                    navigator.vibrate([5000, 5, 5000, 5]);
-                }
-            }
-        });
+        // Привязываем события напрямую к нажатию (pointerdown срабатывает мгновенно без задержек)
+        document.getElementById('btnOn').addEventListener('pointerdown', startVibration);
+        document.getElementById('btnOff').addEventListener('pointerdown', stopVibration);
     </script>
 </body>
 </html>
